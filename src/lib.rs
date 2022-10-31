@@ -1,14 +1,16 @@
 #![deny(warnings)]
 
 use std::fmt;
+use std::{cmp::Ordering, time::Duration};
 
 use dashmap::DashMap;
+use derive_builder::Builder;
 use tracing_core::{
-    callsite::Identifier,
-    field::{display, Field, Value, Visit},
+    callsite::{DefaultCallsite, Identifier},
+    field::{Field, Value, Visit},
     span,
     subscriber::Interest,
-    Event, Metadata, Subscriber,
+    Callsite, Event, Kind, Level, Metadata, Subscriber,
 };
 use tracing_subscriber::layer::{Context, Layer};
 
@@ -24,7 +26,13 @@ use mock_instant::Instant;
 
 const RATE_LIMIT_FIELD: &str = "internal_log_rate_limit";
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
+
 const MESSAGE_FIELD: &str = "message";
+const RATELIMITED_MESSAGE_FIELD: &str = "ratelimited_message";
+const FILTERED_COUNT_FIELD: &str = "filtered_count";
+
+const RATE_LIMIT_STARTED_MESSAGE: &str = "event is being rate limited";
+const RATE_LIMIT_STOPPED_MESSAGE: &str = "event stopped being rate limited";
 
 // These fields will cause events to be independently rate limited by the values
 // for these keys
@@ -37,6 +45,33 @@ struct RateKeyIdentifier {
     rate_limit_key_values: RateLimitedSpanKeys,
 }
 
+#[derive(Builder)]
+#[builder(default, pattern = "owned")]
+pub struct RateLimitConfiguration {
+    /// enable rate-limiting automatically for every callsite
+    auto_enabled: bool,
+
+    /// optional function to decide whether the event should be ratelimitted
+    should_enable_ratelimit: Option<Box<dyn Fn(&Event) -> bool + Send + Sync>>,
+
+    /// max repetitions before rate limit starts
+    threshold: u64,
+
+    /// rate limit duration (after that it gets reset)
+    duration: Duration,
+}
+
+impl Default for RateLimitConfiguration {
+    fn default() -> Self {
+        Self {
+            auto_enabled: false,
+            should_enable_ratelimit: None,
+            threshold: 1,
+            duration: Duration::from_secs(10),
+        }
+    }
+}
+
 pub struct RateLimitedLayer<S, L>
 where
     L: Layer<S> + Sized,
@@ -44,7 +79,7 @@ where
 {
     events: DashMap<RateKeyIdentifier, State>,
     inner: L,
-    internal_log_rate_limit: u64,
+    config: RateLimitConfiguration,
     _subscriber: std::marker::PhantomData<S>,
 }
 
@@ -56,15 +91,29 @@ where
     pub fn new(layer: L) -> Self {
         RateLimitedLayer {
             events: Default::default(),
-            internal_log_rate_limit: 10,
+            config: Default::default(),
             inner: layer,
             _subscriber: std::marker::PhantomData,
         }
     }
 
-    pub fn with_default_limit(mut self, internal_log_rate_limit: u64) -> Self {
-        self.internal_log_rate_limit = internal_log_rate_limit;
+    pub fn with_config(mut self, config: RateLimitConfiguration) -> Self {
+        self.config = config;
         self
+    }
+
+    fn should_ratelimit_event(&self, event: &Event) -> bool {
+        if self.config.auto_enabled {
+            return true;
+        }
+
+        if let Some(should_enable_ratelimit) = self.config.should_enable_ratelimit.as_ref() {
+            if should_enable_ratelimit(event) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -129,14 +178,16 @@ where
         let mut limit_visitor = LimitVisitor::default();
         event.record(&mut limit_visitor);
 
-        let limit_exists = limit_visitor.limit.unwrap_or(false);
+        let limit_exists =
+            self.should_ratelimit_event(event) || limit_visitor.limit.unwrap_or_default();
         if !limit_exists {
             return self.inner.on_event(event, ctx);
         }
 
-        let limit = match limit_visitor.limit_secs {
-            Some(limit_secs) => limit_secs, // override the cli limit
-            None => self.internal_log_rate_limit,
+        let limit_threshold = self.config.threshold;
+        let limit_duration = match limit_visitor.limit_secs {
+            Some(limit_secs) => Duration::from_secs(limit_secs), // override the cli limit
+            None => self.config.duration,
         };
 
         // Visit all of the spans in the scope of this event, looking for specific fields that we use to differentiate
@@ -174,43 +225,39 @@ where
                 .message
                 .unwrap_or_else(|| metadata.name().into());
 
-            State::new(message, limit)
+            State::new(message, limit_threshold, limit_duration)
         });
 
         // Update our rate limiting state for this event, and see if we should still be rate limiting it.
         //
         // When this is the first time seeing the event, we emit it like we normally would. The second time we see it in
-        // the limit period, we emit a new event to indicate that the original event is being actively rate limited.
+        // the limit period, we emit a new event to indicate that the original event is being actively rate limited
         // Otherwise, we don't emit anything.
         let previous_count = state.increment_count();
         if state.should_limit() {
-            match previous_count {
-                0 => self.inner.on_event(event, ctx),
-                1 => {
-                    let message =
-                        format!("Internal log [{}] is being rate limited.", state.message);
-                    self.create_event(&ctx, metadata, message, state.limit);
+            match previous_count.cmp(&limit_threshold) {
+                Ordering::Less => self.inner.on_event(event, ctx),
+                Ordering::Equal => {
+                    self.send_rate_limit_started_event(&ctx, metadata, &state);
                 }
-                _ => {}
+                Ordering::Greater => {}
             }
         } else {
             // If we saw this event 3 or more times total, emit an event that indicates the total number of times we
             // rate limited the event in the limit period.
-            if previous_count > 1 {
-                let message = format!(
-                    "Internal log [{}] has been rate limited {} times.",
-                    state.message,
-                    previous_count - 1
-                );
+            if previous_count > limit_threshold {
+                let filtered_count = previous_count - limit_threshold;
 
-                self.create_event(&ctx, metadata, message, state.limit);
+                self.send_rate_limit_stopped_event(&ctx, metadata, &state, filtered_count);
+                state.reset();
+            } else if state.expired() {
+                // TODO: unify checks
+                state.reset();
             }
 
             // We're not rate limiting anymore, so we also emit the current event as normal.. but we update our rate
             // limiting state since this is effectively equivalent to seeing the event again for the first time.
             self.inner.on_event(event, ctx);
-
-            state.reset();
         }
     }
 
@@ -245,33 +292,122 @@ where
     S: Subscriber,
     L: Layer<S>,
 {
-    fn create_event(
+    fn send_rate_limit_started_event(
         &self,
         ctx: &Context<S>,
-        metadata: &'static Metadata<'static>,
-        message: String,
-        rate_limit: u64,
+        _org_metadata: &'static Metadata<'static>,
+        state: &State,
     ) {
+        // define our record
+        // (just like info!(), but without actually sending the event, since
+        // we want it to go directly to the inner layer)
+        static CALLSITE: DefaultCallsite = {
+            static META: Metadata<'static> = {
+                Metadata::new(
+                    "event ratelimit",
+                    "ratelimit",
+                    Level::INFO,
+                    Some(file!()),
+                    Some(line!()),
+                    Some("ratelimit"),
+                    ::tracing_core::field::FieldSet::new(
+                        &[
+                            MESSAGE_FIELD,
+                            RATELIMITED_MESSAGE_FIELD,
+                            "ratelimit_duration",
+                            "ratelimit_threshold",
+                        ],
+                        ::tracing_core::callsite::Identifier(&CALLSITE),
+                    ),
+                    Kind::EVENT,
+                )
+            };
+            DefaultCallsite::new(&META)
+        };
+
+        // fill all fields
+        let metadata = CALLSITE.metadata();
         let fields = metadata.fields();
+        let mut iter = fields.iter();
 
-        let message = display(message);
+        let duration_sec = state.limit_duration.as_secs();
+        let values = [
+            (
+                &iter.next().unwrap(),
+                Some(&RATE_LIMIT_STARTED_MESSAGE as &dyn Value),
+            ),
+            (&iter.next().unwrap(), Some(&state.message as &dyn Value)),
+            (&iter.next().unwrap(), Some(&duration_sec as &dyn Value)),
+            (
+                &iter.next().unwrap(),
+                Some(&state.limit_threshold as &dyn Value),
+            ),
+        ];
+        let valueset = fields.value_set(&values);
 
-        if let Some(message_field) = fields.field("message") {
-            let values = [(&message_field, Some(&message as &dyn Value))];
+        // send event
+        let event = Event::new(metadata, &valueset);
+        self.inner.on_event(&event, ctx.clone());
+    }
 
-            let valueset = fields.value_set(&values);
-            let event = Event::new(metadata, &valueset);
-            self.inner.on_event(&event, ctx.clone());
-        } else {
-            let values = [(
-                &fields.field(RATE_LIMIT_FIELD).unwrap(),
-                Some(&rate_limit as &dyn Value),
-            )];
+    fn send_rate_limit_stopped_event(
+        &self,
+        ctx: &Context<S>,
+        _org_metadata: &'static Metadata<'static>,
+        state: &State,
+        filtered_count: u64,
+    ) {
+        // define our record
+        // (just like info!(), but without actually sending the event, since
+        // we want it to go directly to the inner layer)
+        static CALLSITE: DefaultCallsite = {
+            static META: Metadata<'static> = {
+                Metadata::new(
+                    "event ratelimit",
+                    "ratelimit",
+                    Level::INFO,
+                    Some(file!()),
+                    Some(line!()),
+                    Some("ratelimit"),
+                    ::tracing_core::field::FieldSet::new(
+                        &[
+                            MESSAGE_FIELD,
+                            RATELIMITED_MESSAGE_FIELD,
+                            "ratelimit_duration",
+                            "ratelimit_threshold",
+                            FILTERED_COUNT_FIELD,
+                        ],
+                        ::tracing_core::callsite::Identifier(&CALLSITE),
+                    ),
+                    Kind::EVENT,
+                )
+            };
+            DefaultCallsite::new(&META)
+        };
 
-            let valueset = fields.value_set(&values);
-            let event = Event::new(metadata, &valueset);
-            self.inner.on_event(&event, ctx.clone());
-        }
+        // fill all fields
+        let metadata = CALLSITE.metadata();
+        let fields = metadata.fields();
+        let mut iter = fields.iter();
+        let duration_sec = state.limit_duration.as_secs();
+        let values = [
+            (
+                &iter.next().unwrap(),
+                Some(&RATE_LIMIT_STOPPED_MESSAGE as &dyn Value),
+            ),
+            (&iter.next().unwrap(), Some(&state.message as &dyn Value)),
+            (&iter.next().unwrap(), Some(&duration_sec as &dyn Value)),
+            (
+                &iter.next().unwrap(),
+                Some(&state.limit_threshold as &dyn Value),
+            ),
+            (&iter.next().unwrap(), Some(&filtered_count as &dyn Value)),
+        ];
+        let valueset = fields.value_set(&values);
+
+        // send event
+        let event = Event::new(metadata, &valueset);
+        self.inner.on_event(&event, ctx.clone());
     }
 }
 
@@ -279,16 +415,18 @@ where
 struct State {
     start: Instant,
     count: u64,
-    limit: u64,
+    limit_threshold: u64,
+    limit_duration: Duration,
     message: String,
 }
 
 impl State {
-    fn new(message: String, limit: u64) -> Self {
+    fn new(message: String, limit_threshold: u64, limit_duration: Duration) -> Self {
         Self {
             start: Instant::now(),
             count: 0,
-            limit,
+            limit_threshold,
+            limit_duration,
             message,
         }
     }
@@ -304,8 +442,12 @@ impl State {
         prev
     }
 
+    fn expired(&self) -> bool {
+        self.start.elapsed() >= self.limit_duration
+    }
+
     fn should_limit(&self) -> bool {
-        self.start.elapsed().as_secs() < self.limit
+        self.count > self.limit_threshold && !self.expired()
     }
 }
 
@@ -452,15 +594,58 @@ mod test {
 
     use super::*;
 
+    #[derive(Default, Debug, PartialEq, Eq)]
+    struct TestVisitor {
+        pub message: Option<String>,
+        pub ratelimited_message: Option<String>,
+        pub filtered_count: Option<u64>,
+    }
+
+    impl From<(&str, Option<&str>, Option<u64>)> for TestVisitor {
+        fn from(value: (&str, Option<&str>, Option<u64>)) -> Self {
+            Self {
+                message: Some(value.0.to_owned()),
+                ratelimited_message: value.1.map(|v| v.to_owned()),
+                filtered_count: value.2,
+            }
+        }
+    }
+
+    impl Visit for TestVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            match field.name() {
+                MESSAGE_FIELD => self.message = Some(value.to_string()),
+                RATELIMITED_MESSAGE_FIELD => self.ratelimited_message = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            if self.filtered_count.is_none() && field.name() == FILTERED_COUNT_FIELD {
+                self.filtered_count = Some(value);
+            }
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            match field.name() {
+                MESSAGE_FIELD => self.message = Some(format!("{:?}", value)),
+                RATELIMITED_MESSAGE_FIELD => {
+                    self.ratelimited_message = Some(format!("{:?}", value))
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingLayer<S> {
-        events: Arc<Mutex<Vec<String>>>,
+        events: Arc<Mutex<Vec<TestVisitor>>>,
 
         _subscriber: std::marker::PhantomData<S>,
     }
 
     impl<S> RecordingLayer<S> {
-        fn new(events: Arc<Mutex<Vec<String>>>) -> Self {
+        fn new(events: Arc<Mutex<Vec<TestVisitor>>>) -> Self {
             RecordingLayer {
                 events,
 
@@ -482,24 +667,36 @@ mod test {
         }
 
         fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-            let mut visitor = MessageVisitor::default();
+            let mut visitor = TestVisitor::default();
             event.record(&mut visitor);
 
             let mut events = self.events.lock().unwrap();
-            events.push(visitor.message.unwrap_or_default());
+            events.push(visitor);
         }
     }
 
     #[test]
     fn rate_limits() {
-        let events: Arc<Mutex<Vec<String>>> = Default::default();
+        let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
-        let sub = tracing_subscriber::registry::Registry::default()
-            .with(RateLimitedLayer::new(recorder).with_default_limit(1));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(
+                RateLimitConfigurationBuilder::default()
+                    .duration(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            ),
+        );
+
         tracing::subscriber::with_default(sub, || {
-            for _ in 0..21 {
-                info!(message = "Hello world!", internal_log_rate_limit = true);
+            for i in 0..21 {
+                info!(
+                    test = i,
+                    // message = "Hello world!",
+                    internal_log_rate_limit = true,
+                    "Hello world!"
+                );
                 MockClock::advance(Duration::from_millis(100));
             }
         });
@@ -509,27 +706,33 @@ mod test {
         assert_eq!(
             *events,
             vec![
-                "Hello world!",
-                "Internal log [Hello world!] is being rate limited.",
-                "Internal log [Hello world!] has been rate limited 9 times.",
-                "Hello world!",
-                "Internal log [Hello world!] is being rate limited.",
-                "Internal log [Hello world!] has been rate limited 9 times.",
-                "Hello world!",
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(9)),
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(9)),
+                ("Hello world!", None, None),
             ]
             .into_iter()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect::<Vec<String>>()
+            .map(|v| v.into())
+            .collect::<Vec<TestVisitor>>()
         );
     }
 
     #[test]
     fn override_rate_limit_at_callsite() {
-        let events: Arc<Mutex<Vec<String>>> = Default::default();
+        let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
-        let sub = tracing_subscriber::registry::Registry::default()
-            .with(RateLimitedLayer::new(recorder).with_default_limit(100));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(
+                RateLimitConfigurationBuilder::default()
+                    .duration(Duration::from_secs(100))
+                    .build()
+                    .unwrap(),
+            ),
+        );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..21 {
                 info!(
@@ -546,27 +749,33 @@ mod test {
         assert_eq!(
             *events,
             vec![
-                "Hello world!",
-                "Internal log [Hello world!] is being rate limited.",
-                "Internal log [Hello world!] has been rate limited 9 times.",
-                "Hello world!",
-                "Internal log [Hello world!] is being rate limited.",
-                "Internal log [Hello world!] has been rate limited 9 times.",
-                "Hello world!",
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(9)),
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(9)),
+                ("Hello world!", None, None),
             ]
             .into_iter()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect::<Vec<String>>()
+            .map(|v| v.into())
+            .collect::<Vec<TestVisitor>>()
         );
     }
 
     #[test]
     fn rate_limit_by_span_key() {
-        let events: Arc<Mutex<Vec<String>>> = Default::default();
+        let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
-        let sub = tracing_subscriber::registry::Registry::default()
-            .with(RateLimitedLayer::new(recorder).with_default_limit(1));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(
+                RateLimitConfigurationBuilder::default()
+                    .duration(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            ),
+        );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..21 {
                 for key in &["foo", "bar"] {
@@ -590,48 +799,118 @@ mod test {
         assert_eq!(
             *events,
             vec![
-                "Hello foo on line_number 1!",
-                "Hello foo on line_number 2!",
-                "Hello bar on line_number 1!",
-                "Hello bar on line_number 2!",
-                "Internal log [Hello foo on line_number 1!] is being rate limited.",
-                "Internal log [Hello foo on line_number 2!] is being rate limited.",
-                "Internal log [Hello bar on line_number 1!] is being rate limited.",
-                "Internal log [Hello bar on line_number 2!] is being rate limited.",
-                "Internal log [Hello foo on line_number 1!] has been rate limited 9 times.",
-                "Hello foo on line_number 1!",
-                "Internal log [Hello foo on line_number 2!] has been rate limited 9 times.",
-                "Hello foo on line_number 2!",
-                "Internal log [Hello bar on line_number 1!] has been rate limited 9 times.",
-                "Hello bar on line_number 1!",
-                "Internal log [Hello bar on line_number 2!] has been rate limited 9 times.",
-                "Hello bar on line_number 2!",
-                "Internal log [Hello foo on line_number 1!] is being rate limited.",
-                "Internal log [Hello foo on line_number 2!] is being rate limited.",
-                "Internal log [Hello bar on line_number 1!] is being rate limited.",
-                "Internal log [Hello bar on line_number 2!] is being rate limited.",
-                "Internal log [Hello foo on line_number 1!] has been rate limited 9 times.",
-                "Hello foo on line_number 1!",
-                "Internal log [Hello foo on line_number 2!] has been rate limited 9 times.",
-                "Hello foo on line_number 2!",
-                "Internal log [Hello bar on line_number 1!] has been rate limited 9 times.",
-                "Hello bar on line_number 1!",
-                "Internal log [Hello bar on line_number 2!] has been rate limited 9 times.",
-                "Hello bar on line_number 2!",
+                ("Hello foo on line_number 1!", None, None),
+                ("Hello foo on line_number 2!", None, None),
+                ("Hello bar on line_number 1!", None, None),
+                ("Hello bar on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 2!", None, None),
             ]
             .into_iter()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect::<Vec<String>>()
+            .map(|v| v.into())
+            .collect::<Vec<TestVisitor>>()
         );
     }
 
     #[test]
     fn rate_limit_by_event_key() {
-        let events: Arc<Mutex<Vec<String>>> = Default::default();
+        let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
-        let sub = tracing_subscriber::registry::Registry::default()
-            .with(RateLimitedLayer::new(recorder).with_default_limit(1));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(
+                RateLimitConfigurationBuilder::default()
+                    .duration(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            ),
+        );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..21 {
                 for key in &["foo", "bar"] {
@@ -654,38 +933,102 @@ mod test {
         assert_eq!(
             *events,
             vec![
-                "Hello foo on line_number 1!",
-                "Hello foo on line_number 2!",
-                "Hello bar on line_number 1!",
-                "Hello bar on line_number 2!",
-                "Internal log [Hello foo on line_number 1!] is being rate limited.",
-                "Internal log [Hello foo on line_number 2!] is being rate limited.",
-                "Internal log [Hello bar on line_number 1!] is being rate limited.",
-                "Internal log [Hello bar on line_number 2!] is being rate limited.",
-                "Internal log [Hello foo on line_number 1!] has been rate limited 9 times.",
-                "Hello foo on line_number 1!",
-                "Internal log [Hello foo on line_number 2!] has been rate limited 9 times.",
-                "Hello foo on line_number 2!",
-                "Internal log [Hello bar on line_number 1!] has been rate limited 9 times.",
-                "Hello bar on line_number 1!",
-                "Internal log [Hello bar on line_number 2!] has been rate limited 9 times.",
-                "Hello bar on line_number 2!",
-                "Internal log [Hello foo on line_number 1!] is being rate limited.",
-                "Internal log [Hello foo on line_number 2!] is being rate limited.",
-                "Internal log [Hello bar on line_number 1!] is being rate limited.",
-                "Internal log [Hello bar on line_number 2!] is being rate limited.",
-                "Internal log [Hello foo on line_number 1!] has been rate limited 9 times.",
-                "Hello foo on line_number 1!",
-                "Internal log [Hello foo on line_number 2!] has been rate limited 9 times.",
-                "Hello foo on line_number 2!",
-                "Internal log [Hello bar on line_number 1!] has been rate limited 9 times.",
-                "Hello bar on line_number 1!",
-                "Internal log [Hello bar on line_number 2!] has been rate limited 9 times.",
-                "Hello bar on line_number 2!",
+                ("Hello foo on line_number 1!", None, None),
+                ("Hello foo on line_number 2!", None, None),
+                ("Hello bar on line_number 1!", None, None),
+                ("Hello bar on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STARTED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    None
+                ),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello foo on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello foo on line_number 2!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 1!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 1!", None, None),
+                (
+                    RATE_LIMIT_STOPPED_MESSAGE,
+                    Some("Hello bar on line_number 2!"),
+                    Some(9)
+                ),
+                ("Hello bar on line_number 2!", None, None),
             ]
             .into_iter()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect::<Vec<String>>()
+            .map(|v| v.into())
+            .collect::<Vec<TestVisitor>>()
         );
     }
 }

@@ -10,6 +10,7 @@ license = "MPL-2.0"
 tracing-core = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 dashmap = { version = "5.2.0", default-features = false }
+derive_builder = "0.11.2"
 
 [dev-dependencies]
 criterion = "0.4"
