@@ -52,6 +52,7 @@ pub struct RateLimitConfiguration {
     auto_enabled: bool,
 
     /// optional function to decide whether the event should be ratelimitted
+    #[allow(clippy::type_complexity)]
     should_enable_ratelimit: Option<Box<dyn Fn(&Event) -> bool + Send + Sync>>,
 
     /// max repetitions before rate limit starts
