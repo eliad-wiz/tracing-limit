@@ -26,6 +26,7 @@ use mock_instant::Instant;
 
 const RATE_LIMIT_FIELD: &str = "internal_log_rate_limit";
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
+const RATE_LIMIT_COUNT_FIELD: &str = "internal_log_rate_count";
 
 const MESSAGE_FIELD: &str = "message";
 const RATELIMITED_MESSAGE_FIELD: &str = "ratelimited_message";
@@ -185,7 +186,11 @@ where
             return self.inner.on_event(event, ctx);
         }
 
-        let limit_threshold = self.config.threshold;
+        let limit_threshold = match limit_visitor.limit_count {
+            Some(count) => count,
+            None => self.config.threshold,
+        };
+
         let limit_duration = match limit_visitor.limit_secs {
             Some(limit_secs) => Duration::from_secs(limit_secs), // override the cli limit
             None => self.config.duration,
@@ -538,6 +543,7 @@ impl Visit for RateLimitedSpanKeys {
 struct LimitVisitor {
     pub limit: Option<bool>,
     pub limit_secs: Option<u64>,
+    pub limit_count: Option<u64>,
 }
 
 impl Visit for LimitVisitor {
@@ -548,17 +554,33 @@ impl Visit for LimitVisitor {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if field.name() == RATE_LIMIT_SECS_FIELD {
-            self.limit = Some(true); // limit if we have this field
-            self.limit_secs = Some(u64::try_from(value).unwrap_or_default()); // override the cli passed limit
+        match field.name() {
+            RATE_LIMIT_SECS_FIELD => {
+                // override the cli passed limit
+                self.limit_secs = Some(u64::try_from(value).unwrap_or_default());
+            }
+            RATE_LIMIT_COUNT_FIELD => {
+                // override the cli passed limit
+                self.limit_count = Some(u64::try_from(value).unwrap_or_default());
+            }
+            _ => return,
         }
+        self.limit = Some(true); // limit if we have these fields
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == RATE_LIMIT_SECS_FIELD {
-            self.limit = Some(true); // limit if we have this field
-            self.limit_secs = Some(value); // override the cli passed limit
+        match field.name() {
+            RATE_LIMIT_SECS_FIELD => {
+                // override the cli passed limit
+                self.limit_secs = Some(value);
+            }
+            RATE_LIMIT_COUNT_FIELD => {
+                // override the cli passed limit
+                self.limit_count = Some(value);
+            }
+            _ => return,
         }
+        self.limit = Some(true); // limit if we have these fields
     }
 
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
@@ -756,6 +778,54 @@ mod test {
                 ("Hello world!", None, None),
                 (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
                 (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(9)),
+                ("Hello world!", None, None),
+            ]
+            .into_iter()
+            .map(|v| v.into())
+            .collect::<Vec<TestVisitor>>()
+        );
+    }
+
+    #[test]
+    fn override_rate_limit_count_at_callsite() {
+        let events = Default::default();
+
+        let recorder = RecordingLayer::new(Arc::clone(&events));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(
+                RateLimitConfigurationBuilder::default()
+                    .duration(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            ),
+        );
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..21 {
+                info!(
+                    message = "Hello world!",
+                    internal_log_rate_limit = true,
+                    internal_log_rate_secs = 1,
+                    internal_log_rate_count = 3,
+                );
+                MockClock::advance(Duration::from_millis(100));
+            }
+        });
+
+        let events = events.lock().unwrap();
+
+        assert_eq!(
+            *events,
+            vec![
+                ("Hello world!", None, None),
+                ("Hello world!", None, None),
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(7)),
+                ("Hello world!", None, None),
+                ("Hello world!", None, None),
+                ("Hello world!", None, None),
+                (RATE_LIMIT_STARTED_MESSAGE, Some("Hello world!"), None),
+                (RATE_LIMIT_STOPPED_MESSAGE, Some("Hello world!"), Some(7)),
                 ("Hello world!", None, None),
             ]
             .into_iter()
