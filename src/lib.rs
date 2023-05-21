@@ -38,7 +38,7 @@ const RATE_LIMIT_STOPPED_MESSAGE: &str = "event stopped being rate limited";
 // These fields will cause events to be independently rate limited by the values
 // for these keys
 const COMPONENT_ID_FIELD: &str = "component_id";
-const VRL_POSITION: &str = "vrl_position";
+const RATELIMIT_UID: &str = "ratelimit_uid";
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 struct RateKeyIdentifier {
@@ -495,14 +495,14 @@ impl From<String> for TraceValue {
 #[derive(Default, Eq, PartialEq, Hash, Clone)]
 struct RateLimitedSpanKeys {
     component_id: Option<TraceValue>,
-    vrl_position: Option<TraceValue>,
+    ratelimit_uid: Option<TraceValue>,
 }
 
 impl RateLimitedSpanKeys {
     fn record(&mut self, field: &Field, value: TraceValue) {
         match field.name() {
             COMPONENT_ID_FIELD => self.component_id = Some(value),
-            VRL_POSITION => self.vrl_position = Some(value),
+            RATELIMIT_UID => self.ratelimit_uid = Some(value),
             _ => {}
         }
     }
@@ -511,8 +511,8 @@ impl RateLimitedSpanKeys {
         if let Some(component_id) = &other.component_id {
             self.component_id = Some(component_id.clone());
         }
-        if let Some(vrl_position) = &other.vrl_position {
-            self.vrl_position = Some(vrl_position.clone());
+        if let Some(ratelimit_uid) = &other.ratelimit_uid {
+            self.ratelimit_uid = Some(ratelimit_uid.clone());
         }
     }
 }
@@ -852,7 +852,7 @@ mod test {
                 for key in &["foo", "bar"] {
                     for line_number in &[1, 2] {
                         let span =
-                            info_span!("span", component_id = &key, vrl_position = &line_number);
+                            info_span!("span", component_id = &key, ratelimit_uid = &line_number);
                         let _enter = span.enter();
                         info!(
                             message =
@@ -991,7 +991,7 @@ mod test {
                                 format!("Hello {} on line_number {}!", key, line_number).as_str(),
                             internal_log_rate_limit = true,
                             component_id = &key,
-                            vrl_position = &line_number
+                            ratelimit_uid = &line_number
                         );
                     }
                 }
