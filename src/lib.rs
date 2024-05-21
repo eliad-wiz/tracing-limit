@@ -617,6 +617,8 @@ mod test {
 
     use super::*;
 
+    static TEST_MUTEX: Mutex<i32> = Mutex::new(1);
+
     #[derive(Default, Debug, PartialEq, Eq)]
     struct TestVisitor {
         pub message: Option<String>,
@@ -700,6 +702,8 @@ mod test {
 
     #[test]
     fn rate_limits() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        MockClock::set_time(Duration::ZERO);
         let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
@@ -745,6 +749,8 @@ mod test {
 
     #[test]
     fn override_rate_limit_at_callsite() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        MockClock::set_time(Duration::ZERO);
         let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
@@ -788,6 +794,8 @@ mod test {
 
     #[test]
     fn override_rate_limit_count_at_callsite() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        MockClock::set_time(Duration::ZERO);
         let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
@@ -836,6 +844,8 @@ mod test {
 
     #[test]
     fn rate_limit_by_span_key() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        MockClock::set_time(Duration::ZERO);
         let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
@@ -971,6 +981,8 @@ mod test {
 
     #[test]
     fn rate_limit_by_event_key() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        MockClock::set_time(Duration::ZERO);
         let events = Default::default();
 
         let recorder = RecordingLayer::new(Arc::clone(&events));
