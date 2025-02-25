@@ -6,11 +6,11 @@ use std::{cmp::Ordering, time::Duration};
 use dashmap::DashMap;
 use derive_builder::Builder;
 use tracing_core::{
+    Callsite, Event, Kind, Level, Metadata, Subscriber,
     callsite::{DefaultCallsite, Identifier},
     field::{Field, Value, Visit},
     span,
     subscriber::Interest,
-    Callsite, Event, Kind, Level, Metadata, Subscriber,
 };
 use tracing_subscriber::layer::{Context, Layer};
 
