@@ -535,7 +535,7 @@ impl Visit for RateLimitedSpanKeys {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
-        self.record(field, format!("{:?}", value).into());
+        self.record(field, format!("{value:?}").into());
     }
 }
 
@@ -600,7 +600,7 @@ impl Visit for MessageVisitor {
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
         if self.message.is_none() && field.name() == MESSAGE_FIELD {
-            self.message = Some(format!("{:?}", value));
+            self.message = Some(format!("{value:?}"));
         }
     }
 }
