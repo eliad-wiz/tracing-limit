@@ -242,11 +242,14 @@ where
         let previous_count = state.increment_count();
         if state.should_limit() {
             match previous_count.cmp(&limit_threshold) {
-                Ordering::Less => self.inner.on_event(event, ctx),
+                Ordering::Less => {} // event will be emitted later
                 Ordering::Equal => {
                     self.send_rate_limit_started_event(&ctx, metadata, &state);
+                    return;
                 }
-                Ordering::Greater => {}
+                Ordering::Greater => {
+                    return;
+                }
             }
         } else {
             // If we saw this event 3 or more times total, emit an event that indicates the total number of times we
@@ -263,8 +266,12 @@ where
 
             // We're not rate limiting anymore, so we also emit the current event as normal.. but we update our rate
             // limiting state since this is effectively equivalent to seeing the event again for the first time.
-            self.inner.on_event(event, ctx);
         }
+
+        // drop state after we're done updating it, so that we don't hold the lock while calling the inner layer
+        drop(state);
+
+        self.inner.on_event(event, ctx);
     }
 
     #[inline]
