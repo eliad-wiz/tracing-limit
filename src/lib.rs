@@ -109,10 +109,10 @@ where
             return true;
         }
 
-        if let Some(should_enable_ratelimit) = self.config.should_enable_ratelimit.as_ref() {
-            if should_enable_ratelimit(event) {
-                return true;
-            }
+        if let Some(should_enable_ratelimit) = self.config.should_enable_ratelimit.as_ref()
+            && should_enable_ratelimit(event)
+        {
+            return true;
         }
 
         false
