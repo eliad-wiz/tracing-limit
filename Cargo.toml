@@ -14,9 +14,9 @@ derive_builder = "0.20.2"
 
 [dev-dependencies]
 criterion = "0.5"
-tracing = "0.1.41"
+tracing = "0.1.44"
 mock_instant = { version = "0.5" }
-tracing-subscriber = { version = "0.3.19", default-features = false, features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["env-filter", "fmt"] }
 
 [[bench]]
 name = "limit"
