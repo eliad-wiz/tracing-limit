@@ -424,7 +424,6 @@ where
     }
 }
 
-#[derive(Debug)]
 struct State {
     start: Instant,
     count: u64,
