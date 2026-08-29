@@ -1,6 +1,7 @@
 #![deny(warnings)]
 
 use std::fmt;
+use std::sync::Arc;
 use std::{cmp::Ordering, time::Duration};
 
 use dashmap::DashMap;
@@ -79,10 +80,29 @@ where
     L: Layer<S> + Sized,
     S: Subscriber,
 {
-    events: DashMap<RateKeyIdentifier, State>,
+    events: Arc<DashMap<RateKeyIdentifier, State>>,
     inner: L,
     config: RateLimitConfiguration,
     _subscriber: std::marker::PhantomData<S>,
+}
+
+/// Clone-cheap handle to a [`RateLimitedLayer`]'s per-callsite accounting
+/// map. Take one with [`RateLimitedLayer::stats`] before moving the layer
+/// into a subscriber, then read it later (e.g. to emit a metric).
+#[derive(Clone)]
+pub struct RateLimitedStats {
+    events: Arc<DashMap<RateKeyIdentifier, State>>,
+}
+
+impl RateLimitedStats {
+    /// Number of live per-callsite accounting entries.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }
 
 impl<S, L> RateLimitedLayer<S, L>
@@ -102,6 +122,14 @@ where
     pub fn with_config(mut self, config: RateLimitConfiguration) -> Self {
         self.config = config;
         self
+    }
+
+    /// Cheap-to-clone handle to this layer's accounting map. Take it
+    /// before moving the layer into the subscriber.
+    pub fn stats(&self) -> RateLimitedStats {
+        RateLimitedStats {
+            events: Arc::clone(&self.events),
+        }
     }
 
     fn should_ratelimit_event(&self, event: &Event) -> bool {
