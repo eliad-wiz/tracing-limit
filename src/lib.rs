@@ -34,6 +34,8 @@
 //!
 //! **Only these fields create distinct rate limit groups:**
 //! - `component_id` - Different components are rate limited independently
+//! - `ratelimit_uid` - A caller-chosen discriminator, for when one callsite needs to be
+//!   split into independently limited groups (e.g. one bucket per rule id)
 //!
 //! **All other fields are ignored for grouping**, including:
 //! - `fanout_id`, `input_id`, `output_id` - Not used for grouping to avoid resource/cost implications from high-cardinality tags
@@ -146,6 +148,7 @@ const RATE_LIMIT_STOPPED_MESSAGE: &str = "event stopped being rate limited";
 // These fields will cause events to be independently rate limited by the values
 // for these keys
 const COMPONENT_ID_FIELD: &str = "component_id";
+const RATELIMIT_UID_FIELD: &str = "ratelimit_uid";
 
 #[derive(Eq, PartialEq, Hash, Clone)]
 struct RateKeyIdentifier {
@@ -628,24 +631,32 @@ impl From<String> for TraceValue {
 ///
 /// **Tracked fields** (only these create distinct rate limit groups):
 /// - `component_id` - Different components are rate limited independently
+/// - `ratelimit_uid` - Caller-chosen discriminator, for splitting one callsite into
+///   independently limited groups (e.g. one bucket per rule id)
 ///
 /// **Ignored fields**: All other fields are ignored for grouping purposes. This avoids resource/cost implications from high-cardinality tags.
 /// ```
 #[derive(Default, Eq, PartialEq, Hash, Clone)]
 struct RateLimitedSpanKeys {
     component_id: Option<TraceValue>,
+    ratelimit_uid: Option<TraceValue>,
 }
 
 impl RateLimitedSpanKeys {
     fn record(&mut self, field: &Field, value: TraceValue) {
-        if field.name() == COMPONENT_ID_FIELD {
-            self.component_id = Some(value);
+        match field.name() {
+            COMPONENT_ID_FIELD => self.component_id = Some(value),
+            RATELIMIT_UID_FIELD => self.ratelimit_uid = Some(value),
+            _ => {}
         }
     }
 
     fn merge(&mut self, other: &Self) {
         if let Some(component_id) = &other.component_id {
             self.component_id = Some(component_id.clone());
+        }
+        if let Some(ratelimit_uid) = &other.ratelimit_uid {
+            self.ratelimit_uid = Some(ratelimit_uid.clone());
         }
     }
 }
@@ -1253,6 +1264,31 @@ mod test {
                 event!("Hello!", component_id: "foo"),
                 started("Hello!", 1),
                 event!("Hello!", component_id: "bar"),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rate_limit_by_ratelimit_uid() {
+        let (events, sub) = setup_test(1);
+        tracing::subscriber::with_default(sub, || {
+            // Same callsite, same message, same component: only ratelimit_uid separates
+            // these into independent rate limit groups.
+            for uid in &["rule_1", "rule_1", "rule_2"] {
+                info!(message = "Hello!", ratelimit_uid = uid);
+                MockClock::advance(Duration::from_millis(100));
+            }
+        });
+
+        let events = events.lock().unwrap();
+
+        assert_eq!(
+            *events,
+            vec![
+                event!("Hello!", ratelimit_uid: "rule_1"),
+                started("Hello!", 1),
+                event!("Hello!", ratelimit_uid: "rule_2"),
             ]
         );
     }
