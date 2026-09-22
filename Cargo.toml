@@ -24,3 +24,32 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 [[bench]]
 name = "limit"
 harness = false
+
+# Everything below stands in for Vector's workspace, which this crate inherits
+# from upstream. Keeping the inherited keys (`workspace = true`) intact means
+# the sections above stay byte-identical to upstream and never conflict on sync.
+[workspace]
+
+[workspace.dependencies]
+criterion = "0.8"
+mock_instant = { version = "0.6" }
+serial_test = { version = "4.0" }
+tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt"] }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(ddsketch_extended)'] }
+
+[workspace.lints.clippy]
+string_slice = "warn"
+await_holding_lock = "warn"
+let_underscore_must_use = "warn"
+unused_async = "warn"
+redundant_clone = "warn"
+undocumented_unsafe_blocks = "warn"
+uninlined_format_args = "warn"
+borrow_as_ptr = "warn"
+checked_conversions = "warn"
+ptr_as_ptr = "warn"
+ref_as_ptr = "warn"
+rc_buffer = "warn"
+todo = "warn"
