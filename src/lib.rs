@@ -40,6 +40,7 @@
 //! - `message` - The log message itself doesn't differentiate groups
 //! - `internal_log_rate_limit` - Control field for enabling/disabling rate limiting
 //! - `internal_log_rate_secs` - Control field for customizing the rate limit window
+//! - `internal_log_rate_count` - Control field for customizing the per-window threshold
 //! - Any custom fields you add
 //!
 //! ## Examples
@@ -131,6 +132,7 @@ use mock_instant::global::Instant;
 
 const RATE_LIMIT_FIELD: &str = "internal_log_rate_limit";
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
+const RATE_LIMIT_COUNT_FIELD: &str = "internal_log_rate_count";
 
 const MESSAGE_FIELD: &str = "message";
 const RATELIMITED_MESSAGE_FIELD: &str = "ratelimited_message";
@@ -303,7 +305,10 @@ where
             return self.inner.on_event(event, ctx);
         }
 
-        let limit_threshold = self.config.threshold;
+        let limit_threshold = match limit_visitor.limit_count {
+            Some(count) => count, // override the cli limit
+            None => self.config.threshold,
+        };
         let limit_duration = match limit_visitor.limit_secs {
             Some(limit_secs) => Duration::from_secs(limit_secs), // override the cli limit
             None => self.config.duration,
@@ -671,6 +676,7 @@ impl Visit for RateLimitedSpanKeys {
 struct LimitVisitor {
     pub limit: Option<bool>,
     pub limit_secs: Option<u64>,
+    pub limit_count: Option<u64>,
 }
 
 impl Visit for LimitVisitor {
@@ -681,17 +687,27 @@ impl Visit for LimitVisitor {
     }
 
     fn record_i64(&mut self, field: &Field, value: i64) {
-        if field.name() == RATE_LIMIT_SECS_FIELD {
-            self.limit = Some(true); // limit if we have this field
-            self.limit_secs = Some(u64::try_from(value).unwrap_or_default()); // override the cli passed limit
+        match field.name() {
+            // override the cli passed limits
+            RATE_LIMIT_SECS_FIELD => {
+                self.limit_secs = Some(u64::try_from(value).unwrap_or_default());
+            }
+            RATE_LIMIT_COUNT_FIELD => {
+                self.limit_count = Some(u64::try_from(value).unwrap_or_default());
+            }
+            _ => return,
         }
+        self.limit = Some(true); // limit if we have these fields
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == RATE_LIMIT_SECS_FIELD {
-            self.limit = Some(true); // limit if we have this field
-            self.limit_secs = Some(value); // override the cli passed limit
+        match field.name() {
+            // override the cli passed limits
+            RATE_LIMIT_SECS_FIELD => self.limit_secs = Some(value),
+            RATE_LIMIT_COUNT_FIELD => self.limit_count = Some(value),
+            _ => return,
         }
+        self.limit = Some(true); // limit if we have these fields
     }
 
     fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
@@ -807,9 +823,10 @@ mod test {
 
             let mut fields = BTreeMap::new();
             for (key, value) in self.fields {
-                if key != "message"
-                    && key != "internal_log_rate_limit"
-                    && key != "internal_log_rate_secs"
+                if key != MESSAGE_FIELD
+                    && key != RATE_LIMIT_FIELD
+                    && key != RATE_LIMIT_SECS_FIELD
+                    && key != RATE_LIMIT_COUNT_FIELD
                 {
                     fields.insert(key, value);
                 }
@@ -976,6 +993,45 @@ mod test {
 
     #[test]
     #[serial]
+    fn override_rate_limit_count_at_callsite() {
+        let (events, sub) = setup_test(100);
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..21 {
+                info!(
+                    message = "Hello world!",
+                    internal_log_rate_secs = 1,
+                    internal_log_rate_count = 3,
+                );
+                MockClock::advance(Duration::from_millis(100));
+            }
+        });
+
+        let events = events.lock().unwrap();
+
+        // A threshold of 3 lets three occurrences through per window before suppression
+        // starts, leaving 7 of the window's 10 to be filtered.
+        let started = || started("Hello world!", 1).with_field(RATELIMIT_THRESHOLD_FIELD, "3");
+        let stopped = || stopped("Hello world!", 1, 7).with_field(RATELIMIT_THRESHOLD_FIELD, "3");
+        assert_eq!(
+            *events,
+            vec![
+                event!("Hello world!"),
+                event!("Hello world!"),
+                event!("Hello world!"),
+                started(),
+                stopped(),
+                event!("Hello world!"),
+                event!("Hello world!"),
+                event!("Hello world!"),
+                started(),
+                stopped(),
+                event!("Hello world!"),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
     fn rate_limit_by_event_key() {
         let (events, sub) = setup_test(1);
         tracing::subscriber::with_default(sub, || {
@@ -1019,8 +1075,9 @@ mod test {
     fn disabled_rate_limit() {
         // Without `auto_enabled`, an event is only limited if it opts in, so
         // `internal_log_rate_limit = false` leaves it untouched.
-        let (events, sub) =
-            setup_test_with_config(RateLimitConfigurationBuilder::default().duration(Duration::from_secs(1)));
+        let (events, sub) = setup_test_with_config(
+            RateLimitConfigurationBuilder::default().duration(Duration::from_secs(1)),
+        );
         tracing::subscriber::with_default(sub, || {
             for _ in 0..21 {
                 info!(message = "Hello world!", internal_log_rate_limit = false);
