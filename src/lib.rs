@@ -9,6 +9,10 @@
 //!
 //! # How it works
 //!
+//! Rate limiting is opt-in, configured through [`RateLimitConfiguration`]: either globally
+//! via `auto_enabled`, per-event via the `should_enable_ratelimit` predicate, or at the
+//! callsite via `internal_log_rate_limit` / `internal_log_rate_secs`.
+//!
 //! Within each rate limit window (default 10 seconds):
 //! - **1st occurrence**: Event is emitted normally
 //! - **2nd occurrence**: Emits a "suppressing" warning
@@ -80,14 +84,14 @@
 //! info!(component_id = "source", input_id = "in_2", "Received data");  // Group H (same group!)
 //! // The input_id field is ignored - only component_id matters
 //!
-//! // Example 7: Disabling rate limiting for specific logs
-//! // Rate limiting is ON by default - explicitly disable for important logs
+//! // Example 7: Declining rate limiting for specific logs
 //! warn!(
 //!     component_id = "critical_component",
 //!     message = "Fatal error occurred",
 //!     internal_log_rate_limit = false
 //! );
-//! // This event will NEVER be rate limited, regardless of how often it fires
+//! // This is the default, and is only meaningful as documentation: a callsite cannot
+//! // opt out of a blanket `auto_enabled` or of the `should_enable_ratelimit` predicate.
 //!
 //! // Example 8: Custom rate limit window for specific events
 //! info!(
@@ -101,9 +105,10 @@
 //! This ensures logs from different components are rate limited independently,
 //! while avoiding resource/cost implications from high-cardinality tags.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use dashmap::DashMap;
+use derive_builder::Builder;
 use tracing_core::{
     Event, Metadata, Subscriber,
     callsite::Identifier,
@@ -137,6 +142,35 @@ struct RateKeyIdentifier {
     rate_limit_key_values: RateLimitedSpanKeys,
 }
 
+/// Controls which events get rate limited, and how long the window is.
+///
+/// Rate limiting is opt-in: an event is only limited if `auto_enabled` is set, if
+/// `should_enable_ratelimit` returns true for it, or if the callsite itself asks for
+/// it via `internal_log_rate_limit` / `internal_log_rate_secs`.
+#[derive(Builder)]
+#[builder(default, pattern = "owned")]
+pub struct RateLimitConfiguration {
+    /// Enable rate limiting automatically for every callsite.
+    auto_enabled: bool,
+
+    /// Optional predicate deciding whether an event should be rate limited.
+    #[allow(clippy::type_complexity)]
+    should_enable_ratelimit: Option<Box<dyn Fn(&Event) -> bool + Send + Sync>>,
+
+    /// Rate limit window; once it elapses the accounting for a callsite resets.
+    duration: Duration,
+}
+
+impl Default for RateLimitConfiguration {
+    fn default() -> Self {
+        Self {
+            auto_enabled: false,
+            should_enable_ratelimit: None,
+            duration: Duration::from_secs(10),
+        }
+    }
+}
+
 pub struct RateLimitedLayer<S, L>
 where
     L: Layer<S> + Sized,
@@ -144,7 +178,7 @@ where
 {
     events: DashMap<RateKeyIdentifier, State>,
     inner: L,
-    internal_log_rate_limit: u64,
+    config: RateLimitConfiguration,
     _subscriber: std::marker::PhantomData<S>,
 }
 
@@ -156,24 +190,38 @@ where
     pub fn new(layer: L) -> Self {
         RateLimitedLayer {
             events: DashMap::default(),
-            internal_log_rate_limit: 10,
+            config: RateLimitConfiguration::default(),
             inner: layer,
             _subscriber: std::marker::PhantomData,
         }
     }
 
-    /// Sets the default rate limit window in seconds.
+    /// Sets the rate limiting policy.
     ///
-    /// This controls how long logs are suppressed before they can be emitted again.
+    /// The window controls how long logs are suppressed before they can be emitted again.
     /// Within each window:
     /// - 1st occurrence: Emitted normally
     /// - 2nd occurrence: Shows "suppressing" warning
     /// - 3rd+ occurrences: Silent until window expires
     /// - After window: Summary and next event emitted on next arrival (see module-level note)
     #[must_use]
-    pub fn with_default_limit(mut self, internal_log_rate_limit: u64) -> Self {
-        self.internal_log_rate_limit = internal_log_rate_limit;
+    pub fn with_config(mut self, config: RateLimitConfiguration) -> Self {
+        self.config = config;
         self
+    }
+
+    fn should_ratelimit_event(&self, event: &Event) -> bool {
+        if self.config.auto_enabled {
+            return true;
+        }
+
+        if let Some(should_enable_ratelimit) = self.config.should_enable_ratelimit.as_ref()
+            && should_enable_ratelimit(event)
+        {
+            return true;
+        }
+
+        false
     }
 }
 
@@ -230,19 +278,21 @@ where
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
-        // Visit the event, grabbing the limit status if one is defined. Rate limiting is ON by default
-        // unless explicitly disabled by setting `internal_log_rate_limit = false`.
+        // Visit the event, grabbing the limit status if one is defined. Rate limiting is OFF by
+        // default; it applies only if the configuration opts the event in, or if the callsite
+        // asks for it explicitly.
         let mut limit_visitor = LimitVisitor::default();
         event.record(&mut limit_visitor);
 
-        let limit_exists = limit_visitor.limit.unwrap_or(true);
+        let limit_exists =
+            self.should_ratelimit_event(event) || limit_visitor.limit.unwrap_or_default();
         if !limit_exists {
             return self.inner.on_event(event, ctx);
         }
 
         let limit = match limit_visitor.limit_secs {
-            Some(limit_secs) => limit_secs, // override the cli limit
-            None => self.internal_log_rate_limit,
+            Some(limit_secs) => Duration::from_secs(limit_secs), // override the cli limit
+            None => self.config.duration,
         };
 
         // Build a composite key from event fields and span context to determine the rate limit group.
@@ -309,7 +359,7 @@ where
                         "Internal log [{}] is being suppressed to avoid flooding.",
                         state.message
                     );
-                    self.create_event(&ctx, metadata, message, state.limit);
+                    self.create_event(&ctx, metadata, message, state.limit.as_secs());
                 }
                 _ => {}
             }
@@ -323,7 +373,7 @@ where
                     previous_count - 1
                 );
 
-                self.create_event(&ctx, metadata, message, state.limit);
+                self.create_event(&ctx, metadata, message, state.limit.as_secs());
             }
 
             // We're not suppressing anymore, so we also emit the current event as normal.. but we update our rate
@@ -401,12 +451,12 @@ where
 struct State {
     start: Instant,
     count: u64,
-    limit: u64,
+    limit: Duration,
     message: String,
 }
 
 impl State {
-    fn new(message: String, limit: u64) -> Self {
+    fn new(message: String, limit: Duration) -> Self {
         Self {
             start: Instant::now(),
             count: 0,
@@ -427,7 +477,7 @@ impl State {
     }
 
     fn should_limit(&self) -> bool {
-        self.start.elapsed().as_secs() < self.limit
+        self.start.elapsed() < self.limit
     }
 }
 
@@ -740,10 +790,25 @@ mod test {
         Arc<Mutex<Vec<RecordedEvent>>>,
         impl Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
     ) {
+        setup_test_with_config(
+            RateLimitConfigurationBuilder::default()
+                .auto_enabled(true)
+                .duration(Duration::from_secs(default_limit)),
+        )
+    }
+
+    /// As [`setup_test`], but with an explicit configuration.
+    fn setup_test_with_config(
+        config: RateLimitConfigurationBuilder,
+    ) -> (
+        Arc<Mutex<Vec<RecordedEvent>>>,
+        impl Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    ) {
         let events: Arc<Mutex<Vec<RecordedEvent>>> = Arc::default();
         let recorder = RecordingLayer::new(Arc::clone(&events));
-        let sub = tracing_subscriber::registry::Registry::default()
-            .with(RateLimitedLayer::new(recorder).with_default_limit(default_limit));
+        let sub = tracing_subscriber::registry::Registry::default().with(
+            RateLimitedLayer::new(recorder).with_config(config.build().expect("valid config")),
+        );
         (events, sub)
     }
 
@@ -846,7 +911,10 @@ mod test {
     #[test]
     #[serial]
     fn disabled_rate_limit() {
-        let (events, sub) = setup_test(1);
+        // Without `auto_enabled`, an event is only limited if it opts in, so
+        // `internal_log_rate_limit = false` leaves it untouched.
+        let (events, sub) =
+            setup_test_with_config(RateLimitConfigurationBuilder::default().duration(Duration::from_secs(1)));
         tracing::subscriber::with_default(sub, || {
             for _ in 0..21 {
                 info!(message = "Hello world!", internal_log_rate_limit = false);
@@ -859,6 +927,24 @@ mod test {
         // All 21 events should be emitted since rate limiting is disabled
         assert_eq!(events.len(), 21);
         assert!(events.iter().all(|e| e == &event!("Hello world!")));
+    }
+
+    #[test]
+    #[serial]
+    fn auto_enabled_overrides_callsite_opt_out() {
+        // `auto_enabled` is a blanket opt-in: it takes precedence over a callsite asking
+        // not to be limited.
+        let (events, sub) = setup_test(1);
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..21 {
+                info!(message = "Hello world!", internal_log_rate_limit = false);
+                MockClock::advance(Duration::from_millis(100));
+            }
+        });
+
+        let events = events.lock().unwrap();
+
+        assert!(events.len() < 21);
     }
 
     #[test]
