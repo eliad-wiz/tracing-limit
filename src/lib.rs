@@ -109,7 +109,7 @@
 //! This ensures logs from different components are rate limited independently,
 //! while avoiding resource/cost implications from high-cardinality tags.
 
-use std::{cmp::Ordering, fmt, time::Duration};
+use std::{cmp::Ordering, fmt, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use derive_builder::Builder;
@@ -194,10 +194,33 @@ where
     L: Layer<S> + Sized,
     S: Subscriber,
 {
-    events: DashMap<RateKeyIdentifier, State>,
+    events: Arc<DashMap<RateKeyIdentifier, State>>,
     inner: L,
     config: RateLimitConfiguration,
     _subscriber: std::marker::PhantomData<S>,
+}
+
+/// Clone-cheap handle to a [`RateLimitedLayer`]'s per-callsite accounting map.
+///
+/// The map holds one entry per distinct rate limit group and is never pruned, so its size is
+/// worth watching. Take a handle with [`RateLimitedLayer::stats`] before moving the layer into
+/// a subscriber, then read it later (e.g. to feed a gauge).
+#[derive(Clone)]
+pub struct RateLimitedStats {
+    events: Arc<DashMap<RateKeyIdentifier, State>>,
+}
+
+impl RateLimitedStats {
+    /// Number of live per-callsite accounting entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }
 
 impl<S, L> RateLimitedLayer<S, L>
@@ -207,10 +230,19 @@ where
 {
     pub fn new(layer: L) -> Self {
         RateLimitedLayer {
-            events: DashMap::default(),
+            events: Arc::default(),
             config: RateLimitConfiguration::default(),
             inner: layer,
             _subscriber: std::marker::PhantomData,
+        }
+    }
+
+    /// Cheap-to-clone handle to this layer's accounting map. Take it before moving the layer
+    /// into the subscriber.
+    #[must_use]
+    pub fn stats(&self) -> RateLimitedStats {
+        RateLimitedStats {
+            events: Arc::clone(&self.events),
         }
     }
 
