@@ -13,10 +13,11 @@
 //! via `auto_enabled`, per-event via the `should_enable_ratelimit` predicate, or at the
 //! callsite via `internal_log_rate_limit` / `internal_log_rate_secs`.
 //!
-//! Within each rate limit window (default 10 seconds):
-//! - **1st occurrence**: Event is emitted normally
-//! - **2nd occurrence**: Emits a "suppressing" warning
-//! - **3rd+ occurrences**: Silent until window expires
+//! Within each rate limit window (default 10 seconds), with a `threshold` of N
+//! occurrences allowed through (default 1):
+//! - **First N occurrences**: Emitted normally
+//! - **Occurrence N+1**: Emits a "suppressing" warning
+//! - **Beyond that**: Silent until window expires
 //! - **After window**: Emits a summary of suppressed count, then next event normally
 //!
 //! Note: the suppressed-count summary and the resumption of normal emission are both
@@ -105,7 +106,7 @@
 //! This ensures logs from different components are rate limited independently,
 //! while avoiding resource/cost implications from high-cardinality tags.
 
-use std::{fmt, time::Duration};
+use std::{cmp::Ordering, fmt, time::Duration};
 
 use dashmap::DashMap;
 use derive_builder::Builder;
@@ -157,6 +158,9 @@ pub struct RateLimitConfiguration {
     #[allow(clippy::type_complexity)]
     should_enable_ratelimit: Option<Box<dyn Fn(&Event) -> bool + Send + Sync>>,
 
+    /// How many occurrences pass through per window before suppression kicks in.
+    threshold: u64,
+
     /// Rate limit window; once it elapses the accounting for a callsite resets.
     duration: Duration,
 }
@@ -166,6 +170,7 @@ impl Default for RateLimitConfiguration {
         Self {
             auto_enabled: false,
             should_enable_ratelimit: None,
+            threshold: 1,
             duration: Duration::from_secs(10),
         }
     }
@@ -290,7 +295,8 @@ where
             return self.inner.on_event(event, ctx);
         }
 
-        let limit = match limit_visitor.limit_secs {
+        let limit_threshold = self.config.threshold;
+        let limit_duration = match limit_visitor.limit_secs {
             Some(limit_secs) => Duration::from_secs(limit_secs), // override the cli limit
             None => self.config.duration,
         };
@@ -342,45 +348,45 @@ where
                 .message
                 .unwrap_or_else(|| metadata.name().into());
 
-            State::new(message, limit)
+            State::new(message, limit_threshold, limit_duration)
         });
 
         // Update our suppressed state for this event, and see if we should still be suppressing it.
         //
-        // When this is the first time seeing the event, we emit it like we normally would. The second time we see it in
-        // the limit period, we emit a new event to indicate that the original event is being actively suppressed.
-        // Otherwise, we don't emit anything.
+        // The first `threshold` occurrences within a window are emitted as normal. The one right
+        // after that announces the event is now being suppressed; the rest are dropped.
         let previous_count = state.increment_count();
         if state.should_limit() {
-            match previous_count {
-                0 => self.inner.on_event(event, ctx),
-                1 => {
+            match previous_count.cmp(&limit_threshold) {
+                Ordering::Less => self.inner.on_event(event, ctx),
+                Ordering::Equal => {
                     let message = format!(
                         "Internal log [{}] is being suppressed to avoid flooding.",
                         state.message
                     );
-                    self.create_event(&ctx, metadata, message, state.limit.as_secs());
+                    self.create_event(&ctx, metadata, message, state.limit_duration.as_secs());
                 }
-                _ => {}
+                Ordering::Greater => {}
             }
         } else {
-            // If we saw this event 3 or more times total, emit an event that indicates the total number of times we
-            // suppressed the event in the limit period.
-            if previous_count > 1 {
+            // If we suppressed anything at all in the window that just closed, report how much.
+            if previous_count > limit_threshold {
+                let filtered_count = previous_count - limit_threshold;
                 let message = format!(
                     "Internal log [{}] has been suppressed {} times.",
-                    state.message,
-                    previous_count - 1
+                    state.message, filtered_count
                 );
 
-                self.create_event(&ctx, metadata, message, state.limit.as_secs());
+                self.create_event(&ctx, metadata, message, state.limit_duration.as_secs());
+                state.reset();
+            } else if state.expired() {
+                // The window elapsed without ever crossing the threshold; start a fresh one so
+                // the count doesn't accumulate across unrelated windows.
+                state.reset();
             }
 
-            // We're not suppressing anymore, so we also emit the current event as normal.. but we update our rate
-            // limiting state since this is effectively equivalent to seeing the event again for the first time.
+            // We're not suppressing anymore, so we also emit the current event as normal.
             self.inner.on_event(event, ctx);
-
-            state.reset();
         }
     }
 
@@ -451,16 +457,18 @@ where
 struct State {
     start: Instant,
     count: u64,
-    limit: Duration,
+    limit_threshold: u64,
+    limit_duration: Duration,
     message: String,
 }
 
 impl State {
-    fn new(message: String, limit: Duration) -> Self {
+    fn new(message: String, limit_threshold: u64, limit_duration: Duration) -> Self {
         Self {
             start: Instant::now(),
             count: 0,
-            limit,
+            limit_threshold,
+            limit_duration,
             message,
         }
     }
@@ -476,8 +484,12 @@ impl State {
         prev
     }
 
+    fn expired(&self) -> bool {
+        self.start.elapsed() >= self.limit_duration
+    }
+
     fn should_limit(&self) -> bool {
-        self.start.elapsed() < self.limit
+        self.count > self.limit_threshold && !self.expired()
     }
 }
 
