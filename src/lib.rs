@@ -111,9 +111,9 @@ use std::{cmp::Ordering, fmt, time::Duration};
 use dashmap::DashMap;
 use derive_builder::Builder;
 use tracing_core::{
-    Event, Metadata, Subscriber,
-    callsite::Identifier,
-    field::{Field, Value, Visit, display},
+    Callsite, Event, Kind, Level, Metadata, Subscriber,
+    callsite::{DefaultCallsite, Identifier},
+    field::{Field, Value, Visit},
     span,
     subscriber::Interest,
 };
@@ -131,7 +131,15 @@ use mock_instant::global::Instant;
 
 const RATE_LIMIT_FIELD: &str = "internal_log_rate_limit";
 const RATE_LIMIT_SECS_FIELD: &str = "internal_log_rate_secs";
+
 const MESSAGE_FIELD: &str = "message";
+const RATELIMITED_MESSAGE_FIELD: &str = "ratelimited_message";
+const FILTERED_COUNT_FIELD: &str = "filtered_count";
+const RATELIMIT_DURATION_FIELD: &str = "ratelimit_duration";
+const RATELIMIT_THRESHOLD_FIELD: &str = "ratelimit_threshold";
+
+const RATE_LIMIT_STARTED_MESSAGE: &str = "event is being rate limited";
+const RATE_LIMIT_STOPPED_MESSAGE: &str = "event stopped being rate limited";
 
 // These fields will cause events to be independently rate limited by the values
 // for these keys
@@ -360,11 +368,7 @@ where
             match previous_count.cmp(&limit_threshold) {
                 Ordering::Less => self.inner.on_event(event, ctx),
                 Ordering::Equal => {
-                    let message = format!(
-                        "Internal log [{}] is being suppressed to avoid flooding.",
-                        state.message
-                    );
-                    self.create_event(&ctx, metadata, message, state.limit_duration.as_secs());
+                    self.send_rate_limit_started_event(&ctx, &state);
                 }
                 Ordering::Greater => {}
             }
@@ -372,12 +376,8 @@ where
             // If we suppressed anything at all in the window that just closed, report how much.
             if previous_count > limit_threshold {
                 let filtered_count = previous_count - limit_threshold;
-                let message = format!(
-                    "Internal log [{}] has been suppressed {} times.",
-                    state.message, filtered_count
-                );
 
-                self.create_event(&ctx, metadata, message, state.limit_duration.as_secs());
+                self.send_rate_limit_stopped_event(&ctx, &state, filtered_count);
                 state.reset();
             } else if state.expired() {
                 // The window elapsed without ever crossing the threshold; start a fresh one so
@@ -421,35 +421,111 @@ where
     S: Subscriber,
     L: Layer<S>,
 {
-    fn create_event(
-        &self,
-        ctx: &Context<S>,
-        metadata: &'static Metadata<'static>,
-        message: String,
-        rate_limit: u64,
-    ) {
+    /// Announce that a callsite has started being rate limited.
+    fn send_rate_limit_started_event(&self, ctx: &Context<S>, state: &State) {
+        // Declare our own callsite, the way info!() would, but build and dispatch the event by
+        // hand so it goes straight to the inner layer instead of back through the subscriber.
+        static CALLSITE: DefaultCallsite = {
+            static META: Metadata<'static> = Metadata::new(
+                "event ratelimit",
+                "ratelimit",
+                Level::INFO,
+                Some(file!()),
+                Some(line!()),
+                Some("ratelimit"),
+                ::tracing_core::field::FieldSet::new(
+                    &[
+                        MESSAGE_FIELD,
+                        RATELIMITED_MESSAGE_FIELD,
+                        RATELIMIT_DURATION_FIELD,
+                        RATELIMIT_THRESHOLD_FIELD,
+                    ],
+                    ::tracing_core::callsite::Identifier(&CALLSITE),
+                ),
+                Kind::EVENT,
+            );
+            DefaultCallsite::new(&META)
+        };
+
+        let metadata = CALLSITE.metadata();
         let fields = metadata.fields();
+        let mut iter = fields.iter();
+        let (Some(message), Some(ratelimited_message), Some(duration), Some(threshold)) =
+            (iter.next(), iter.next(), iter.next(), iter.next())
+        else {
+            return;
+        };
 
-        let message = display(message);
+        let duration_secs = state.limit_duration.as_secs();
+        let values = [
+            (&message, Some(&RATE_LIMIT_STARTED_MESSAGE as &dyn Value)),
+            (&ratelimited_message, Some(&state.message as &dyn Value)),
+            (&duration, Some(&duration_secs as &dyn Value)),
+            (&threshold, Some(&state.limit_threshold as &dyn Value)),
+        ];
+        let valueset = fields.value_set(&values);
 
-        if let Some(message_field) = fields.field("message") {
-            let values = [(&message_field, Some(&message as &dyn Value))];
+        let event = Event::new(metadata, &valueset);
+        self.inner.on_event(&event, ctx.clone());
+    }
 
-            let valueset = fields.value_set(&values);
-            let event = Event::new(metadata, &valueset);
-            self.inner.on_event(&event, ctx.clone());
-        } else if let Some(rate_limit_field) = fields.field(RATE_LIMIT_FIELD) {
-            let values = [(&rate_limit_field, Some(&rate_limit as &dyn Value))];
+    /// Announce that a callsite stopped being rate limited, and how much it swallowed.
+    fn send_rate_limit_stopped_event(&self, ctx: &Context<S>, state: &State, filtered_count: u64) {
+        static CALLSITE: DefaultCallsite = {
+            static META: Metadata<'static> = Metadata::new(
+                "event ratelimit",
+                "ratelimit",
+                Level::INFO,
+                Some(file!()),
+                Some(line!()),
+                Some("ratelimit"),
+                ::tracing_core::field::FieldSet::new(
+                    &[
+                        MESSAGE_FIELD,
+                        RATELIMITED_MESSAGE_FIELD,
+                        RATELIMIT_DURATION_FIELD,
+                        RATELIMIT_THRESHOLD_FIELD,
+                        FILTERED_COUNT_FIELD,
+                    ],
+                    ::tracing_core::callsite::Identifier(&CALLSITE),
+                ),
+                Kind::EVENT,
+            );
+            DefaultCallsite::new(&META)
+        };
 
-            let valueset = fields.value_set(&values);
-            let event = Event::new(metadata, &valueset);
-            self.inner.on_event(&event, ctx.clone());
-        } else {
-            // If the event metadata has neither a "message" nor "internal_log_rate_limit" field,
-            // we cannot create a proper synthetic event. This can happen with custom debug events
-            // that have their own field structure. In this case, we simply skip emitting the
-            // rate limit notification rather than panicking.
-        }
+        let metadata = CALLSITE.metadata();
+        let fields = metadata.fields();
+        let mut iter = fields.iter();
+        let (
+            Some(message),
+            Some(ratelimited_message),
+            Some(duration),
+            Some(threshold),
+            Some(filtered),
+        ) = (
+            iter.next(),
+            iter.next(),
+            iter.next(),
+            iter.next(),
+            iter.next(),
+        )
+        else {
+            return;
+        };
+
+        let duration_secs = state.limit_duration.as_secs();
+        let values = [
+            (&message, Some(&RATE_LIMIT_STOPPED_MESSAGE as &dyn Value)),
+            (&ratelimited_message, Some(&state.message as &dyn Value)),
+            (&duration, Some(&duration_secs as &dyn Value)),
+            (&threshold, Some(&state.limit_threshold as &dyn Value)),
+            (&filtered, Some(&filtered_count as &dyn Value)),
+        ];
+        let valueset = fields.value_set(&values);
+
+        let event = Event::new(metadata, &valueset);
+        self.inner.on_event(&event, ctx.clone());
     }
 }
 
@@ -794,6 +870,24 @@ mod test {
         }
     }
 
+    /// The notification emitted when `message`'s callsite starts being rate limited,
+    /// over a window of `secs` and the default threshold of 1.
+    fn started(message: &str, secs: u64) -> RecordedEvent {
+        RecordedEvent::new(RATE_LIMIT_STARTED_MESSAGE)
+            .with_field(RATELIMITED_MESSAGE_FIELD, message)
+            .with_field(RATELIMIT_DURATION_FIELD, secs.to_string())
+            .with_field(RATELIMIT_THRESHOLD_FIELD, "1")
+    }
+
+    /// As [`started`], for the notification closing the window out.
+    fn stopped(message: &str, secs: u64, filtered: u64) -> RecordedEvent {
+        RecordedEvent::new(RATE_LIMIT_STOPPED_MESSAGE)
+            .with_field(RATELIMITED_MESSAGE_FIELD, message)
+            .with_field(RATELIMIT_DURATION_FIELD, secs.to_string())
+            .with_field(RATELIMIT_THRESHOLD_FIELD, "1")
+            .with_field(FILTERED_COUNT_FIELD, filtered.to_string())
+    }
+
     /// Helper function to set up a test with a rate-limited subscriber.
     /// Returns the events Arc for asserting on collected events.
     fn setup_test(
@@ -841,11 +935,11 @@ mod test {
             *events,
             vec![
                 event!("Hello world!"),
-                event!("Internal log [Hello world!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello world!] has been suppressed 9 times."),
+                started("Hello world!", 1),
+                stopped("Hello world!", 1, 9),
                 event!("Hello world!"),
-                event!("Internal log [Hello world!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello world!] has been suppressed 9 times."),
+                started("Hello world!", 1),
+                stopped("Hello world!", 1, 9),
                 event!("Hello world!"),
             ]
         );
@@ -872,10 +966,10 @@ mod test {
             *events,
             vec![
                 event!("Hello world!"),
-                event!("Internal log [Hello world!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello world!] has been suppressed 19 times."),
+                started("Hello world!", 2),
+                stopped("Hello world!", 2, 19),
                 event!("Hello world!"),
-                event!("Internal log [Hello world!] is being suppressed to avoid flooding."),
+                started("Hello world!", 2),
             ]
         );
     }
@@ -904,17 +998,17 @@ mod test {
             vec![
                 event!("Hello foo!", component_id: "foo"),
                 event!("Hello bar!", component_id: "bar"),
-                event!("Internal log [Hello foo!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello bar!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello foo!] has been suppressed 9 times."),
+                started("Hello foo!", 1),
+                started("Hello bar!", 1),
+                stopped("Hello foo!", 1, 9),
                 event!("Hello foo!", component_id: "foo"),
-                event!("Internal log [Hello bar!] has been suppressed 9 times."),
+                stopped("Hello bar!", 1, 9),
                 event!("Hello bar!", component_id: "bar"),
-                event!("Internal log [Hello foo!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello bar!] is being suppressed to avoid flooding."),
-                event!("Internal log [Hello foo!] has been suppressed 9 times."),
+                started("Hello foo!", 1),
+                started("Hello bar!", 1),
+                stopped("Hello foo!", 1, 9),
                 event!("Hello foo!", component_id: "foo"),
-                event!("Internal log [Hello bar!] has been suppressed 9 times."),
+                stopped("Hello bar!", 1, 9),
                 event!("Hello bar!", component_id: "bar"),
             ]
         );
@@ -989,14 +1083,14 @@ mod test {
             vec![
                 // First iteration - first emits, second shows suppression, 3rd+ silent
                 event!("Routing event", component_id: "router", fanout_id: "output_1"),
-                event!("Internal log [Routing event] is being suppressed to avoid flooding."),
+                started("Routing event", 1),
                 // After rate limit window (1 sec) - summary shows suppressions
-                event!("Internal log [Routing event] has been suppressed 29 times."),
+                stopped("Routing event", 1, 29),
                 event!("Routing event", component_id: "router", fanout_id: "output_1"),
-                event!("Internal log [Routing event] is being suppressed to avoid flooding."),
-                event!("Internal log [Routing event] has been suppressed 29 times."),
+                started("Routing event", 1),
+                stopped("Routing event", 1, 29),
                 event!("Routing event", component_id: "router", fanout_id: "output_1"),
-                event!("Internal log [Routing event] is being suppressed to avoid flooding."),
+                started("Routing event", 1),
             ]
         );
     }
@@ -1029,11 +1123,11 @@ mod test {
             *events,
             vec![
                 event!("Nested event", component_id: "child"),
-                event!("Internal log [Nested event] is being suppressed to avoid flooding.", component_id: "child"),
-                event!("Internal log [Nested event] has been suppressed 9 times.", component_id: "child"),
+                started("Nested event", 1).with_field("component_id", "child"),
+                stopped("Nested event", 1, 9).with_field("component_id", "child"),
                 event!("Nested event", component_id: "child"),
-                event!("Internal log [Nested event] is being suppressed to avoid flooding.", component_id: "child"),
-                event!("Internal log [Nested event] has been suppressed 9 times.", component_id: "child"),
+                started("Nested event", 1).with_field("component_id", "child"),
+                stopped("Nested event", 1, 9).with_field("component_id", "child"),
                 event!("Nested event", component_id: "child"),
             ]
         );
@@ -1066,23 +1160,11 @@ mod test {
             *events,
             vec![
                 event!("Event message", component_id: "transform"),
-                event!(
-                    "Internal log [Event message] is being suppressed to avoid flooding.",
-                    component_id: "transform"
-                ),
-                event!(
-                    "Internal log [Event message] has been suppressed 9 times.",
-                    component_id: "transform"
-                ),
+                started("Event message", 1).with_field("component_id", "transform"),
+                stopped("Event message", 1, 9).with_field("component_id", "transform"),
                 event!("Event message", component_id: "transform"),
-                event!(
-                    "Internal log [Event message] is being suppressed to avoid flooding.",
-                    component_id: "transform"
-                ),
-                event!(
-                    "Internal log [Event message] has been suppressed 9 times.",
-                    component_id: "transform"
-                ),
+                started("Event message", 1).with_field("component_id", "transform"),
+                stopped("Event message", 1, 9).with_field("component_id", "transform"),
                 event!("Event message", component_id: "transform"),
             ]
         );
@@ -1112,7 +1194,7 @@ mod test {
             *events,
             vec![
                 event!("Hello!", component_id: "foo"),
-                event!("Internal log [Hello!] is being suppressed to avoid flooding."),
+                started("Hello!", 1),
                 event!("Hello!", component_id: "bar"),
             ]
         );
@@ -1121,9 +1203,13 @@ mod test {
     #[test]
     #[serial]
     fn events_with_custom_fields_no_message_dont_panic() {
-        // Verify events without "message" or "internal_log_rate_limit" fields don't panic
-        // when rate limiting skips suppression notifications.
+        // Events carrying neither "message" nor "internal_log_rate_limit" are still reported
+        // on: the notifications have their own callsite, so they no longer have to borrow the
+        // original event's field layout and no longer have to be skipped for lack of one.
         let (events, sub) = setup_test(1);
+        // Keep adjacent to the debug! below: with no message field the notifications name the
+        // event after its callsite, so the assertion needs that line number.
+        let event_line = line!() + 4;
         tracing::subscriber::with_default(sub, || {
             // Use closure to ensure all events share the same callsite
             let emit_event = || {
@@ -1145,12 +1231,14 @@ mod test {
 
         let events = events.lock().unwrap();
 
-        // First event from window 1, first event from window 2
-        // Suppression notifications are skipped (no message field)
+        // First event from window 1, the notifications around it, then the first of window 2.
+        let name = format!("event {}:{}", file!(), event_line);
         assert_eq!(
             *events,
             vec![
                 event!("", component_id: "test_component", utilization: "0.85"),
+                started(&name, 1),
+                stopped(&name, 1, 4),
                 event!("", component_id: "test_component", utilization: "0.85"),
             ]
         );
