@@ -371,21 +371,27 @@ where
         //
         // The first `threshold` occurrences within a window are emitted as normal. The one right
         // after that announces the event is now being suppressed; the rest are dropped.
+        //
+        // Decide here what to emit, but emit it further down, once the entry's lock is released:
+        // the inner layer may well log something itself, and if it lands on a callsite that hashes
+        // to this same shard it would deadlock against the guard we are holding.
         let previous_count = state.increment_count();
-        if state.should_limit() {
+        let mut notification = None;
+        let forward_event = if state.should_limit() {
             match previous_count.cmp(&limit_threshold) {
-                Ordering::Less => self.inner.on_event(event, ctx),
+                Ordering::Less => true,
                 Ordering::Equal => {
-                    self.send_rate_limit_started_event(&ctx, &state);
+                    notification = Some(Notification::started(&state));
+                    false
                 }
-                Ordering::Greater => {}
+                Ordering::Greater => false,
             }
         } else {
             // If we suppressed anything at all in the window that just closed, report how much.
             if previous_count > limit_threshold {
                 let filtered_count = previous_count - limit_threshold;
 
-                self.send_rate_limit_stopped_event(&ctx, &state, filtered_count);
+                notification = Some(Notification::stopped(&state, filtered_count));
                 state.reset();
             } else if state.expired() {
                 // The window elapsed without ever crossing the threshold; start a fresh one so
@@ -393,7 +399,15 @@ where
                 state.reset();
             }
 
-            // We're not suppressing anymore, so we also emit the current event as normal.
+            true
+        };
+
+        drop(state);
+
+        if let Some(notification) = notification {
+            self.send_notification(&ctx, &notification);
+        }
+        if forward_event {
             self.inner.on_event(event, ctx);
         }
     }
@@ -429,8 +443,18 @@ where
     S: Subscriber,
     L: Layer<S>,
 {
+    /// Emit `notification`, now that the accounting map's lock has been released.
+    fn send_notification(&self, ctx: &Context<S>, notification: &Notification) {
+        match notification.filtered_count {
+            None => self.send_rate_limit_started_event(ctx, notification),
+            Some(filtered_count) => {
+                self.send_rate_limit_stopped_event(ctx, notification, filtered_count);
+            }
+        }
+    }
+
     /// Announce that a callsite has started being rate limited.
-    fn send_rate_limit_started_event(&self, ctx: &Context<S>, state: &State) {
+    fn send_rate_limit_started_event(&self, ctx: &Context<S>, notification: &Notification) {
         // Declare our own callsite, the way info!() would, but build and dispatch the event by
         // hand so it goes straight to the inner layer instead of back through the subscriber.
         static CALLSITE: DefaultCallsite = {
@@ -464,12 +488,18 @@ where
             return;
         };
 
-        let duration_secs = state.limit_duration.as_secs();
+        let duration_secs = notification.limit_duration.as_secs();
         let values = [
             (&message, Some(&RATE_LIMIT_STARTED_MESSAGE as &dyn Value)),
-            (&ratelimited_message, Some(&state.message as &dyn Value)),
+            (
+                &ratelimited_message,
+                Some(&notification.message as &dyn Value),
+            ),
             (&duration, Some(&duration_secs as &dyn Value)),
-            (&threshold, Some(&state.limit_threshold as &dyn Value)),
+            (
+                &threshold,
+                Some(&notification.limit_threshold as &dyn Value),
+            ),
         ];
         let valueset = fields.value_set(&values);
 
@@ -478,7 +508,12 @@ where
     }
 
     /// Announce that a callsite stopped being rate limited, and how much it swallowed.
-    fn send_rate_limit_stopped_event(&self, ctx: &Context<S>, state: &State, filtered_count: u64) {
+    fn send_rate_limit_stopped_event(
+        &self,
+        ctx: &Context<S>,
+        notification: &Notification,
+        filtered_count: u64,
+    ) {
         static CALLSITE: DefaultCallsite = {
             static META: Metadata<'static> = Metadata::new(
                 "event ratelimit",
@@ -522,18 +557,55 @@ where
             return;
         };
 
-        let duration_secs = state.limit_duration.as_secs();
+        let duration_secs = notification.limit_duration.as_secs();
         let values = [
             (&message, Some(&RATE_LIMIT_STOPPED_MESSAGE as &dyn Value)),
-            (&ratelimited_message, Some(&state.message as &dyn Value)),
+            (
+                &ratelimited_message,
+                Some(&notification.message as &dyn Value),
+            ),
             (&duration, Some(&duration_secs as &dyn Value)),
-            (&threshold, Some(&state.limit_threshold as &dyn Value)),
+            (
+                &threshold,
+                Some(&notification.limit_threshold as &dyn Value),
+            ),
             (&filtered, Some(&filtered_count as &dyn Value)),
         ];
         let valueset = fields.value_set(&values);
 
         let event = Event::new(metadata, &valueset);
         self.inner.on_event(&event, ctx.clone());
+    }
+}
+
+/// A rate limit notification that has been decided on but not yet emitted.
+///
+/// Copied out of [`State`] so the accounting map's lock can be dropped before the notification
+/// is handed to the inner layer.
+struct Notification {
+    message: String,
+    limit_duration: Duration,
+    limit_threshold: u64,
+    /// `None` for the notice opening a suppression window, `Some(n)` for the summary
+    /// closing one out.
+    filtered_count: Option<u64>,
+}
+
+impl Notification {
+    fn started(state: &State) -> Self {
+        Self {
+            message: state.message.clone(),
+            limit_duration: state.limit_duration,
+            limit_threshold: state.limit_threshold,
+            filtered_count: None,
+        }
+    }
+
+    fn stopped(state: &State, filtered_count: u64) -> Self {
+        Self {
+            filtered_count: Some(filtered_count),
+            ..Self::started(state)
+        }
     }
 }
 
